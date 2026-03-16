@@ -66,65 +66,76 @@ def save_adversarial_video_direct(
     original_video_path: str,
     output_path: str,
     eps: float = 8/255,
+    model_std: torch.Tensor = None,
 ):
-    """
-    Save adversarial video by applying perturbation to original video.
-
-    Uses ffmpeg directly for reliable video I/O.
-    Uses smooth random noise instead of block-based perturbation to avoid visible artifacts.
-    """
     import subprocess
     import tempfile
     import shutil
 
-    # Use fixed random seed for reproducibility (based on video path)
-    seed = hash(original_video_path) % (2**32)
-    rng = np.random.RandomState(seed)
+    # pixel_values shape: [N_patches, D] where D = 3 * temporal_patch_size * 14 * 14
+    # Qwen3-VL Conv3d patch embed: channel dim (3) is first in the D dimension.
+    perturbation = pixel_values_adv - pixel_values_clean  # [N, D], normalized space
+    N, D = perturbation.shape
 
-    # Create temporary directory for frames
+    # Denormalize: reshape to [N, 3, D/3] so std broadcasts over channel dim only.
+    # model_std should come from the same attacker instance to stay in sync (Fix 4).
+    if model_std is None:
+        model_std = torch.tensor([0.26862954, 0.26130258, 0.27577711])
+    model_std = model_std.to(device=perturbation.device, dtype=perturbation.dtype).view(3)
+    p = perturbation.view(N, 3, -1) * model_std.view(1, 3, 1)  # [N, 3, D/3], in [0,1] scale
+
+    # Mean over spatial+temporal dims → per-patch per-channel perturbation [N, 3]
+    patch_perturbations = p.mean(dim=2).cpu().numpy()  # [N, 3] RGB
+
+    t, grid_h, grid_w = video_grid_thw[0].tolist()
+    t, grid_h, grid_w = int(t), int(grid_h), int(grid_w)
+
     temp_dir = tempfile.mkdtemp()
 
     try:
-        # Extract frames using ffmpeg
         frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
-        subprocess.run([
-            'ffmpeg', '-y', '-i', original_video_path,
-            '-vsync', '0', frame_pattern
-        ], capture_output=True, check=True)
+        subprocess.run(['ffmpeg', '-y', '-i', original_video_path, '-vsync', '0', frame_pattern],
+                       capture_output=True, check=True)
 
-        # Get list of extracted frames
         frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.png")))
         total_frames = len(frame_files)
-
         if total_frames == 0:
-            print(f"Error: No frames extracted from {original_video_path}")
             return None
 
-        # Process each frame with smooth random noise
+        temporal_patch_size = 2
+        total_temporal_units = t * temporal_patch_size
+        frames_per_unit = max(1, total_frames // total_temporal_units) if total_temporal_units > 0 else total_frames
+
         for frame_idx, frame_file in enumerate(frame_files):
-            frame = cv2.imread(frame_file)
+            frame = cv2.imread(frame_file)  # BGR
             if frame is None:
                 continue
 
             height, width = frame.shape[:2]
+            temporal_idx = min(frame_idx // frames_per_unit, total_temporal_units - 1)
+            t_idx = temporal_idx // temporal_patch_size
 
-            # Generate smooth random noise using Gaussian blur
-            # First create random noise in [-1, 1]
-            raw_noise = rng.uniform(-1, 1, (height, width, 3)).astype(np.float32)
+            # Build per-pixel RGB noise from continuous per-patch perturbations
+            noise_blocks = np.zeros((height, width, 3), dtype=np.float32)
 
-            # Apply Gaussian blur to make noise smoother (reduces visible artifacts)
-            smooth_noise = cv2.GaussianBlur(raw_noise, (15, 15), 5)
+            for h_idx in range(grid_h):
+                for w_idx in range(grid_w):
+                    patch_idx = t_idx * grid_h * grid_w + h_idx * grid_w + w_idx
+                    p_val_rgb = patch_perturbations[patch_idx] if patch_idx < len(patch_perturbations) else np.zeros(3)
+                    p_val_rgb = np.clip(p_val_rgb, -eps, eps)
 
-            # Normalize to [-1, 1] range and scale by eps
-            smooth_noise = smooth_noise / (np.abs(smooth_noise).max() + 1e-8)
-            noise = smooth_noise * eps * 255
+                    y_start = int(h_idx * height / grid_h)
+                    y_end   = int((h_idx + 1) * height / grid_h)
+                    x_start = int(w_idx * width / grid_w)
+                    x_end   = int((w_idx + 1) * width / grid_w)
 
-            # Apply perturbation to frame
-            frame_float = frame.astype(np.float32)
-            frame_adv = frame_float + noise
-            frame_adv = np.clip(frame_adv, 0, 255).astype(np.uint8)
+                    # RGB → BGR for OpenCV, scale to pixel range [0,255]
+                    noise_blocks[y_start:y_end, x_start:x_end] = p_val_rgb[::-1] * 255.0
 
-            # Save modified frame
+            kernel_size = max(31, min(height, width) // max(grid_h, grid_w)) | 1
+            noise_smooth = cv2.GaussianBlur(noise_blocks, (kernel_size, kernel_size), kernel_size / 3)
+
+            frame_adv = np.clip(frame.astype(np.float32) + noise_smooth, 0, 255).astype(np.uint8)
             cv2.imwrite(frame_file, frame_adv)
 
         # Get original video FPS
@@ -133,7 +144,6 @@ def save_adversarial_video_direct(
             '-show_entries', 'stream=r_frame_rate',
             '-of', 'csv=p=0', original_video_path
         ], capture_output=True, text=True)
-
         fps_str = probe_result.stdout.strip()
         if '/' in fps_str:
             num, den = fps_str.split('/')
@@ -141,7 +151,6 @@ def save_adversarial_video_direct(
         else:
             fps = float(fps_str) if fps_str else 30.0
 
-        # Encode frames back to video using ffmpeg
         subprocess.run([
             'ffmpeg', '-y', '-framerate', str(fps),
             '-i', frame_pattern,
@@ -158,7 +167,6 @@ def save_adversarial_video_direct(
         print(f"Error processing video: {e}")
         return None
     finally:
-        # Clean up temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -227,15 +235,123 @@ def save_video_with_uniform_perturbation(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def save_pixel_level_adversarial_video(
+    result: dict,
+    original_video_path: str,
+    output_path: str,
+):
+    """
+    Save adversarial video from pixel-level attack results.
+
+    This function takes the perturbed frames from pixel-level attack
+    and reconstructs the full video by interpolating perturbations
+    to non-sampled frames.
+
+    Args:
+        result: Dictionary from attack_video_pixel_level()
+        original_video_path: Path to original video
+        output_path: Path to save adversarial video
+    """
+    import subprocess
+    import tempfile
+    import shutil
+
+    adv_frames = result['adv_frames']  # [T_sampled, H, W, C] RGB uint8
+    clean_frames = result['clean_frames']
+    sampled_indices = result['sampled_indices']
+    total_frames = result['total_frames']
+    original_fps = result.get('original_fps', 30.0)
+
+    # Compute per-frame perturbation
+    perturbation = adv_frames.astype(np.float32) - clean_frames.astype(np.float32)
+
+    temp_dir = tempfile.mkdtemp()
+
+    try:
+        # Extract all original frames
+        frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
+        subprocess.run([
+            'ffmpeg', '-y', '-i', original_video_path,
+            '-vsync', '0', frame_pattern
+        ], capture_output=True, check=True)
+
+        frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.png")))
+
+        # Create a mapping from sampled indices to perturbations
+        # For non-sampled frames, interpolate from nearest sampled frames
+        for frame_idx, frame_file in enumerate(frame_files):
+            frame = cv2.imread(frame_file)
+            if frame is None:
+                continue
+
+            # Find the closest sampled frame(s)
+            if frame_idx in sampled_indices:
+                # Exact match - use the perturbation directly
+                sample_idx = sampled_indices.index(frame_idx)
+                noise = perturbation[sample_idx]
+            else:
+                # Interpolate between nearest sampled frames
+                # Find surrounding sampled indices
+                prev_idx = None
+                next_idx = None
+                for i, si in enumerate(sampled_indices):
+                    if si <= frame_idx:
+                        prev_idx = i
+                    if si >= frame_idx and next_idx is None:
+                        next_idx = i
+                        break
+
+                if prev_idx is None:
+                    prev_idx = 0
+                if next_idx is None:
+                    next_idx = len(sampled_indices) - 1
+
+                if prev_idx == next_idx:
+                    noise = perturbation[prev_idx]
+                else:
+                    # Linear interpolation
+                    prev_frame_idx = sampled_indices[prev_idx]
+                    next_frame_idx = sampled_indices[next_idx]
+                    t = (frame_idx - prev_frame_idx) / max(1, next_frame_idx - prev_frame_idx)
+                    noise = (1 - t) * perturbation[prev_idx] + t * perturbation[next_idx]
+
+            # Resize noise if needed (frame sizes might differ)
+            if noise.shape[:2] != frame.shape[:2]:
+                noise = cv2.resize(noise, (frame.shape[1], frame.shape[0]))
+
+            # Apply perturbation (convert RGB noise to BGR for cv2)
+            noise_bgr = noise[:, :, ::-1]  # RGB to BGR
+            frame_float = frame.astype(np.float32)
+            frame_adv = np.clip(frame_float + noise_bgr, 0, 255).astype(np.uint8)
+
+            cv2.imwrite(frame_file, frame_adv)
+
+        # Encode back to video
+        subprocess.run([
+            'ffmpeg', '-y', '-framerate', str(original_fps),
+            '-i', frame_pattern,
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+            '-preset', 'fast', output_path
+        ], capture_output=True, check=True)
+
+        return output_path
+
+    except Exception as e:
+        print(f"Error saving pixel-level video: {e}")
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Batch attack NuScenes videos")
     parser.add_argument("--data_dir", type=str, default="data",
                         help="Data directory containing NuScenes")
-    parser.add_argument("--output_dir", type=str, default="data/NuScenes_Attack",
+    parser.add_argument("--output_dir", type=str, default="data/NuScenes_Attack_Patch",
                         help="Output directory for attacked videos")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-4B-Instruct",
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                         help="Model path")
-    parser.add_argument("--device", type=str, default="cuda:0",
+    parser.add_argument("--device", type=str, default="cuda:1",
                         help="Device to run on")
     parser.add_argument("--eps", type=float, default=8/255,
                         help="Perturbation budget")
@@ -249,6 +365,9 @@ def main():
                         help="Maximum number of videos to process")
     parser.add_argument("--save_pt", action="store_true",
                         help="Also save .pt files with pixel_values")
+    parser.add_argument("--attack_type", type=str, default="patch",
+                        choices=["patch", "pixel"],
+                        help="Attack type: 'patch' (faster, may have block artifacts) or 'pixel' (slower, smoother)")
     args = parser.parse_args()
 
     # Create output directory
@@ -295,25 +414,43 @@ def main():
             continue
 
         try:
-            # Run attack
-            result = attacker.attack_video(
-                video_path=video_path,
-                eps=args.eps,
-                alpha=args.alpha,
-                num_iter=args.iter,
-                fps=args.fps,
-                verbose=False,
-            )
-
-            # Save adversarial video
-            save_adversarial_video_direct(
-                pixel_values_clean=result['pixel_values_clean'],
-                pixel_values_adv=result['pixel_values_adv'],
-                video_grid_thw=result['video_grid_thw'],
-                eps=args.eps,
-                original_video_path=video_path,
-                output_path=output_video_path,
-            )
+            # Run attack based on attack type
+            if args.attack_type == "pixel":
+                # Pixel-level attack (slower but smoother)
+                result = attacker.attack_video_pixel_level(
+                    video_path=video_path,
+                    eps=args.eps,
+                    alpha=args.alpha,
+                    num_iter=args.iter,
+                    fps=args.fps,
+                    verbose=False,
+                )
+                # Save using pixel-level function
+                save_pixel_level_adversarial_video(
+                    result=result,
+                    original_video_path=video_path,
+                    output_path=output_video_path,
+                )
+            else:
+                # Patch-level attack (faster, default)
+                result = attacker.attack_video(
+                    video_path=video_path,
+                    eps=args.eps,
+                    alpha=args.alpha,
+                    num_iter=args.iter,
+                    fps=args.fps,
+                    verbose=False,
+                )
+                # Save using patch-level function
+                save_adversarial_video_direct(
+                    pixel_values_clean=result['pixel_values_clean'],
+                    pixel_values_adv=result['pixel_values_adv'],
+                    video_grid_thw=result['video_grid_thw'],
+                    eps=args.eps,
+                    original_video_path=video_path,
+                    output_path=output_video_path,
+                    model_std=attacker.image_std.cpu(),
+                )
 
             # Save .pt file if requested
             if args.save_pt:
@@ -357,6 +494,7 @@ def main():
         f.write(f"Attack Summary\n")
         f.write(f"{'='*60}\n")
         f.write(f"Model: {args.model}\n")
+        f.write(f"Attack type: {args.attack_type}\n")
         f.write(f"eps: {args.eps}\n")
         f.write(f"alpha: {args.alpha}\n")
         f.write(f"iterations: {args.iter}\n")
