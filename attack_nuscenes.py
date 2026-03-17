@@ -52,6 +52,28 @@ def get_all_videos(data_dir: str) -> list:
     return videos
 
 
+def get_qa_scenes_videos(input_dir: str) -> list:
+    """Get all video paths from a flat QA_Scenes directory (token/CAM_FRONT.mp4)."""
+    videos = []
+    if not os.path.exists(input_dir):
+        print(f"Error: directory not found: {input_dir}")
+        return videos
+
+    for token_dir in sorted(os.listdir(input_dir)):
+        token_path = os.path.join(input_dir, token_dir)
+        if not os.path.isdir(token_path):
+            continue
+        for video_file in os.listdir(token_path):
+            if video_file.endswith('.mp4'):
+                videos.append({
+                    'path': os.path.join(token_path, video_file),
+                    'token': token_dir,
+                    'camera': video_file.replace('.mp4', ''),
+                })
+
+    return videos
+
+
 def create_output_dir(output_base: str, scene: str, token: str) -> str:
     """Create output directory structure matching input."""
     output_dir = os.path.join(output_base, scene, token)
@@ -343,10 +365,56 @@ def save_pixel_level_adversarial_video(
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def run_attack(attacker, video_path, args):
+    """Run attack on a single video and return result dict."""
+    if args.attack_type == "pixel":
+        result = attacker.attack_video_pixel_level(
+            video_path=video_path,
+            eps=args.eps,
+            alpha=args.alpha,
+            num_iter=args.iter,
+            fps=args.fps,
+            verbose=False,
+        )
+    else:
+        result = attacker.attack_video(
+            video_path=video_path,
+            eps=args.eps,
+            alpha=args.alpha,
+            num_iter=args.iter,
+            fps=args.fps,
+            verbose=False,
+        )
+    return result
+
+
+def save_result(result, args, video_path, output_video_path, attacker):
+    """Save adversarial video to output_video_path."""
+    if args.attack_type == "pixel":
+        save_pixel_level_adversarial_video(
+            result=result,
+            original_video_path=video_path,
+            output_path=output_video_path,
+        )
+    else:
+        save_adversarial_video_direct(
+            pixel_values_clean=result['pixel_values_clean'],
+            pixel_values_adv=result['pixel_values_adv'],
+            video_grid_thw=result['video_grid_thw'],
+            eps=args.eps,
+            original_video_path=video_path,
+            output_path=output_video_path,
+            model_std=attacker.image_std.cpu(),
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Batch attack NuScenes videos")
     parser.add_argument("--data_dir", type=str, default="data",
-                        help="Data directory containing NuScenes")
+                        help="Data directory containing NuScenes subdirectory (original mode)")
+    parser.add_argument("--input_dir", type=str, default=None,
+                        help="Flat input directory with structure <token>/<camera>.mp4 "
+                             "(e.g. data/QA_Scenes_500). Takes precedence over --data_dir.")
     parser.add_argument("--output_dir", type=str, default="data/NuScenes_Attack_Patch",
                         help="Output directory for attacked videos")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-4B-Instruct",
@@ -361,26 +429,58 @@ def main():
                         help="Number of iterations")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="Video sampling FPS")
+    parser.add_argument("--start_index", type=int, default=0,
+                        help="Start processing from this video index (legacy; prefer --gpu_id/--num_gpus)")
     parser.add_argument("--max_videos", type=int, default=None,
-                        help="Maximum number of videos to process")
+                        help="Maximum number of videos to process (applied after --start_index)")
+    parser.add_argument("--num_gpus", type=int, default=1,
+                        help="Total number of parallel GPU workers")
+    parser.add_argument("--gpu_id", type=int, default=0,
+                        help="Index of this GPU worker (0-based). Combined with --num_gpus, "
+                             "this worker takes every num_gpus-th UNFINISHED video starting at gpu_id.")
     parser.add_argument("--save_pt", action="store_true",
                         help="Also save .pt files with pixel_values")
     parser.add_argument("--attack_type", type=str, default="patch",
                         choices=["patch", "pixel"],
-                        help="Attack type: 'patch' (faster, may have block artifacts) or 'pixel' (slower, smoother)")
+                        help="Attack type: 'patch' (faster) or 'pixel' (smoother)")
     args = parser.parse_args()
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Get all videos
-    print(f"Scanning for videos in {args.data_dir}/NuScenes...")
-    videos = get_all_videos(args.data_dir)
-    print(f"Found {len(videos)} videos")
+    # Collect videos
+    if args.input_dir is not None:
+        print(f"Scanning for videos in {args.input_dir} (flat mode)...")
+        videos = get_qa_scenes_videos(args.input_dir)
+        flat_mode = True
+    else:
+        print(f"Scanning for videos in {args.data_dir}/NuScenes...")
+        videos = get_all_videos(args.data_dir)
+        flat_mode = False
+    print(f"Found {len(videos)} videos total")
+
+    # Legacy index slicing
+    if args.start_index > 0:
+        videos = videos[args.start_index:]
+        print(f"Starting from index {args.start_index}, {len(videos)} videos remaining")
 
     if args.max_videos:
         videos = videos[:args.max_videos]
-        print(f"Processing first {args.max_videos} videos")
+        print(f"Capped at {args.max_videos} videos")
+
+    # Multi-GPU split: filter to unfinished videos first, then distribute by round-robin
+    if args.num_gpus > 1:
+        def output_path_for(video_info):
+            if flat_mode:
+                return os.path.join(args.output_dir, video_info['token'],
+                                    f"{video_info['camera']}.mp4")
+            else:
+                return os.path.join(args.output_dir, video_info['scene'],
+                                    video_info['token'], f"{video_info['camera']}.mp4")
+
+        remaining = [v for v in videos if not os.path.exists(output_path_for(v))]
+        videos = remaining[args.gpu_id::args.num_gpus]
+        print(f"GPU {args.gpu_id}/{args.num_gpus}: {len(remaining)} unfinished → assigned {len(videos)}")
 
     if len(videos) == 0:
         print("No videos found!")
@@ -394,69 +494,39 @@ def main():
         dtype=torch.float32,
     )
 
-    # Process each video
     results_summary = []
 
     for video_info in tqdm(videos, desc="Attacking videos"):
         video_path = video_info['path']
-        scene = video_info['scene']
         token = video_info['token']
         camera = video_info['camera']
 
-        # Create output directory
-        output_scene_dir = create_output_dir(args.output_dir, scene, token)
-        output_video_path = os.path.join(output_scene_dir, f"{camera}.mp4")
-        output_pt_path = os.path.join(output_scene_dir, f"{camera}.pt")
+        # Determine output path
+        if flat_mode:
+            out_dir = os.path.join(args.output_dir, token)
+            os.makedirs(out_dir, exist_ok=True)
+            output_video_path = os.path.join(out_dir, f"{camera}.mp4")
+            output_pt_path = os.path.join(out_dir, f"{camera}.pt")
+            label = f"{token}/{camera}"
+        else:
+            scene = video_info['scene']
+            output_scene_dir = create_output_dir(args.output_dir, scene, token)
+            output_video_path = os.path.join(output_scene_dir, f"{camera}.mp4")
+            output_pt_path = os.path.join(output_scene_dir, f"{camera}.pt")
+            label = f"{scene}/{token}/{camera}"
 
         # Skip if already processed
         if os.path.exists(output_video_path) and not args.save_pt:
-            print(f"Skipping {video_path} (already exists)")
+            print(f"Skipping {label} (already exists)")
             continue
 
         try:
-            # Run attack based on attack type
-            if args.attack_type == "pixel":
-                # Pixel-level attack (slower but smoother)
-                result = attacker.attack_video_pixel_level(
-                    video_path=video_path,
-                    eps=args.eps,
-                    alpha=args.alpha,
-                    num_iter=args.iter,
-                    fps=args.fps,
-                    verbose=False,
-                )
-                # Save using pixel-level function
-                save_pixel_level_adversarial_video(
-                    result=result,
-                    original_video_path=video_path,
-                    output_path=output_video_path,
-                )
-            else:
-                # Patch-level attack (faster, default)
-                result = attacker.attack_video(
-                    video_path=video_path,
-                    eps=args.eps,
-                    alpha=args.alpha,
-                    num_iter=args.iter,
-                    fps=args.fps,
-                    verbose=False,
-                )
-                # Save using patch-level function
-                save_adversarial_video_direct(
-                    pixel_values_clean=result['pixel_values_clean'],
-                    pixel_values_adv=result['pixel_values_adv'],
-                    video_grid_thw=result['video_grid_thw'],
-                    eps=args.eps,
-                    original_video_path=video_path,
-                    output_path=output_video_path,
-                    model_std=attacker.image_std.cpu(),
-                )
+            result = run_attack(attacker, video_path, args)
+            save_result(result, args, video_path, output_video_path, attacker)
 
-            # Save .pt file if requested
             if args.save_pt:
                 torch.save(result, output_pt_path)
 
-            # Record summary
             results_summary.append({
                 'video': video_path,
                 'output': output_video_path,
@@ -465,10 +535,11 @@ def main():
                 'reduction': result['initial_cos_sim'] - result['final_cos_sim'],
             })
 
-            print(f"  {scene}/{token}/{camera}: cos_sim {result['initial_cos_sim']:.4f} -> {result['final_cos_sim']:.4f}")
+            print(f"  {label}: cos_sim {result['initial_cos_sim']:.4f} -> {result['final_cos_sim']:.4f}")
 
         except Exception as e:
             print(f"Error processing {video_path}: {e}")
+            import traceback; traceback.print_exc()
             continue
 
     # Print summary
