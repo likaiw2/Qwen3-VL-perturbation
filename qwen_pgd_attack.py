@@ -681,6 +681,194 @@ class Qwen3VLPGD:
             'is_video': True,  # Indicates this is a video attack
         }
 
+    def attack_video_qa(
+        self,
+        video_path: str,
+        question: str,
+        answer: str,
+        eps: float = 8/255,
+        alpha: float = 1/255,
+        num_iter: int = 100,
+        fps: float = 1.0,
+        verbose: bool = True,
+    ) -> Dict:
+        """
+        Full-pipeline PGD attack: maximize cross-entropy loss on GT answer.
+
+        Unlike the feature-level attack (attack_video) which only disrupts visual
+        features, this attack optimizes end-to-end: perturb video pixels so the
+        full VLM produces incorrect answers to the given question.
+
+        Requires full model (vision_only=False).
+
+        Args:
+            video_path: Path to the input video file
+            question: The question to ask about the video
+            answer: Ground truth answer (attack maximizes loss against this)
+            eps: Maximum perturbation magnitude (L-infinity) in pixel space [0,1]
+            alpha: Step size per PGD iteration
+            num_iter: Number of PGD iterations
+            fps: Frames per second for video sampling
+            verbose: Whether to print progress
+
+        Returns:
+            Dictionary with attack results including pixel_values_adv,
+            initial_loss, final_loss, loss_history, perturbation stats, etc.
+        """
+        assert not self.vision_only, (
+            "attack_video_qa requires the full model (vision_only must be False). "
+            "The LLM is needed to compute the QA cross-entropy loss."
+        )
+
+        start_time = time.time()
+
+        # --- 1. Build prompt-only and full (prompt+answer) texts ---
+        messages_prompt = [
+            {"role": "user", "content": [
+                {"type": "video", "video": video_path,
+                 "max_pixels": 360 * 420, "fps": fps},
+                {"type": "text", "text": question},
+            ]}
+        ]
+        messages_full = messages_prompt + [
+            {"role": "assistant", "content": [
+                {"type": "text", "text": answer},
+            ]}
+        ]
+
+        prompt_text = self.processor.apply_chat_template(
+            messages_prompt, tokenize=False, add_generation_prompt=True)
+        full_text = self.processor.apply_chat_template(
+            messages_full, tokenize=False, add_generation_prompt=False)
+
+        # --- 2. Process video once, tokenize twice ---
+        if QWEN_VL_UTILS_AVAILABLE:
+            image_inputs, video_inputs = process_vision_info(messages_prompt)
+        else:
+            image_inputs, video_inputs = None, [video_path]
+
+        inputs_prompt = self.processor(
+            text=[prompt_text], images=image_inputs,
+            videos=video_inputs, return_tensors="pt")
+        prompt_len = inputs_prompt['input_ids'].shape[1]
+
+        inputs_full = self.processor(
+            text=[full_text], images=image_inputs,
+            videos=video_inputs, return_tensors="pt")
+        inputs_full = {k: v.to(self.device) for k, v in inputs_full.items()}
+
+        # --- 3. Create labels: -100 for prompt, real ids for answer ---
+        input_ids = inputs_full['input_ids']
+        attention_mask = inputs_full['attention_mask']
+        labels = input_ids.clone()
+        labels[:, :prompt_len] = -100  # mask prompt tokens from loss
+
+        if verbose:
+            answer_len = input_ids.shape[1] - prompt_len
+            print(f"\n  QA-PGD attack: prompt_len={prompt_len}, "
+                  f"answer_len={answer_len}, total={input_ids.shape[1]}")
+
+        # --- 4. Extract pixel values ---
+        pixel_values_clean = inputs_full['pixel_values_videos'].to(self.dtype)
+        video_grid_thw = inputs_full['video_grid_thw']
+
+        # --- 5. Compute initial loss (before attack) ---
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values_videos=pixel_values_clean,
+                video_grid_thw=video_grid_thw,
+                labels=labels,
+            )
+            initial_loss = outputs.loss.item()
+
+        if verbose:
+            print(f"  Initial CE loss = {initial_loss:.6f}")
+
+        # --- 6. PGD loop: maximize CE loss ---
+        pixel_values_adv = pixel_values_clean.clone().detach()
+        best_adv = pixel_values_adv.clone()
+        best_loss = initial_loss
+        loss_history = []
+
+        for i in range(num_iter):
+            pixel_values_adv = pixel_values_adv.detach().requires_grad_(True)
+
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values_videos=pixel_values_adv,
+                video_grid_thw=video_grid_thw,
+                labels=labels,
+            )
+            loss = outputs.loss
+            loss.backward()
+
+            grad = pixel_values_adv.grad.detach()
+            current_loss = loss.item()
+            loss_history.append(current_loss)
+
+            # Track best: HIGHEST loss = most successful attack
+            if current_loss > best_loss:
+                best_loss = current_loss
+                best_adv = pixel_values_adv.detach().clone()
+
+            if verbose and (i % 10 == 0 or i == num_iter - 1):
+                print(f"  Iter {i:3d}: CE_loss = {current_loss:.6f}")
+
+            # PGD update: gradient ASCENT (+) to maximize loss
+            with torch.no_grad():
+                N, D = pixel_values_adv.shape
+                pv_adv_view = pixel_values_adv.view(N, 3, -1)
+                grad_view = grad.view(N, 3, -1)
+                pv_clean_view = pixel_values_clean.view(N, 3, -1)
+                std_view = self.image_std.view(1, 3, 1)
+                mean_view = self.image_mean.view(1, 3, 1)
+
+                # Gradient ascent in normalized space
+                pv_adv_view = pv_adv_view + (alpha / std_view) * grad_view.sign()
+                # Project to pixel space, clip perturbation, clip pixel range
+                clean_01 = pv_clean_view * std_view + mean_view
+                adv_01 = pv_adv_view * std_view + mean_view
+                perturbation = torch.clamp(adv_01 - clean_01, -eps, eps)
+                adv_01_projected = torch.clamp(clean_01 + perturbation, 0.0, 1.0)
+                # Back to normalized space
+                pixel_values_adv = ((adv_01_projected - mean_view) / std_view).view(N, D)
+
+        # --- 7. Compute perturbation stats ---
+        with torch.no_grad():
+            N, D = pixel_values_clean.shape
+            std_view = self.image_std.view(1, 3, 1)
+            mean_view = self.image_mean.view(1, 3, 1)
+            clean_01_final = pixel_values_clean.view(N, 3, -1) * std_view + mean_view
+            best_adv_01 = best_adv.view(N, 3, -1) * std_view + mean_view
+            perturbation_final = (best_adv_01 - clean_01_final).view(N, D)
+
+        elapsed_time = time.time() - start_time
+
+        return {
+            'pixel_values_adv': best_adv.detach().cpu(),
+            'pixel_values_clean': pixel_values_clean.detach().cpu(),
+            'perturbation': perturbation_final.detach().cpu(),
+            'video_grid_thw': video_grid_thw.cpu(),
+            'initial_loss': initial_loss,
+            'final_loss': best_loss,
+            'loss_history': loss_history,
+            'eps': eps,
+            'alpha': alpha,
+            'num_iter': num_iter,
+            'elapsed_time': elapsed_time,
+            'video_path': video_path,
+            'question': question,
+            'answer': answer,
+            'perturbation_l_inf': perturbation_final.abs().max().item(),
+            'perturbation_l2': perturbation_final.norm(2).item(),
+            'is_video': True,
+            'attack_type': 'qa_pgd',
+        }
+
+
     def attack(
         self,
         image_path: str,
