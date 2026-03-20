@@ -9,8 +9,12 @@ Usage:
 """
 
 import argparse
+import csv
 import os
 import glob
+import subprocess
+import sys
+from datetime import datetime
 import torch
 import cv2
 import numpy as np
@@ -415,7 +419,7 @@ def main():
     parser.add_argument("--input_dir", type=str, default=None,
                         help="Flat input directory with structure <token>/<camera>.mp4 "
                              "(e.g. data/QA_Scenes_500). Takes precedence over --data_dir.")
-    parser.add_argument("--output_dir", type=str, default="data/NuScenes_Attack_Patch",
+    parser.add_argument("--output_dir", type=str, default="/data/likai/nuscene_tasks/0320",
                         help="Output directory for attacked videos")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                         help="Model path")
@@ -443,7 +447,122 @@ def main():
     parser.add_argument("--attack_type", type=str, default="patch",
                         choices=["patch", "pixel"],
                         help="Attack type: 'patch' (faster) or 'pixel' (smoother)")
+    parser.add_argument("--vision_only", "--vision-only", action="store_true", default=True,
+                        help="Only load vision encoder, skip LLM to save VRAM")
+    parser.add_argument("--parallel", action="store_true",
+                        help="Auto-launch parallel workers on multiple GPUs. "
+                             "Uses --num_gpus (default 2) workers, one per cuda device.")
+    parser.add_argument("--log_dir", type=str, default=None,
+                        help="Directory for logs and CSV. Auto-created as logs/mmdd_hhmmss "
+                             "in --parallel mode if not specified.")
     args = parser.parse_args()
+
+    # --parallel mode: spawn one subprocess per GPU, then merge CSV results
+    if args.parallel:
+        num_gpus = args.num_gpus if args.num_gpus > 1 else 2  # default to 2 GPUs
+
+        # Create timestamped log directory: logs/mmdd_hhmmss/
+        if args.log_dir is None:
+            timestamp = datetime.now().strftime("%m%d_%H%M%S")
+            log_dir = os.path.join("logs", timestamp)
+        else:
+            log_dir = args.log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        print(f"Log directory: {log_dir}")
+
+        # Scan videos and count remaining (for user feedback)
+        os.makedirs(args.output_dir, exist_ok=True)
+        if args.input_dir is not None:
+            all_videos = get_qa_scenes_videos(args.input_dir)
+            flat_mode = True
+        else:
+            all_videos = get_all_videos(args.data_dir)
+            flat_mode = False
+
+        def _out_path(v):
+            if flat_mode:
+                return os.path.join(args.output_dir, v['token'], f"{v['camera']}.mp4")
+            return os.path.join(args.output_dir, v['scene'], v['token'], f"{v['camera']}.mp4")
+
+        remaining = [v for v in all_videos if not os.path.exists(_out_path(v))]
+        print(f"=== Parallel mode: {len(all_videos)} total, "
+              f"{len(remaining)} remaining → {num_gpus} workers ===")
+
+        if len(remaining) == 0:
+            print("All videos already processed!")
+            return
+
+        processes = []
+        log_files = []
+        for gid in range(num_gpus):
+            cmd = [sys.executable, __file__]
+            # Forward all original arguments, replacing gpu-specific ones
+            for arg_name, arg_val in vars(args).items():
+                if arg_name == 'parallel':
+                    continue  # don't recurse
+                if arg_name == 'num_gpus':
+                    cmd += ['--num_gpus', str(num_gpus)]
+                    continue
+                if arg_name == 'gpu_id':
+                    cmd += ['--gpu_id', str(gid)]
+                    continue
+                if arg_name == 'device':
+                    cmd += ['--device', f'cuda:{gid}']
+                    continue
+                if arg_name == 'log_dir':
+                    cmd += ['--log_dir', log_dir]
+                    continue
+                # Handle boolean flags
+                key = f'--{arg_name}'
+                if isinstance(arg_val, bool):
+                    if arg_val:
+                        cmd.append(key)
+                elif arg_val is not None:
+                    cmd += [key, str(arg_val)]
+
+            # Redirect each worker's output to its own log file
+            log_path = os.path.join(log_dir, f"attack_gpu{gid}.log")
+            lf = open(log_path, 'w')
+            log_files.append(lf)
+
+            n_assigned = len(remaining[gid::num_gpus])
+            print(f"  Worker {gid}: cuda:{gid} (~{n_assigned} videos) → {log_path}")
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+            processes.append(proc)
+
+        # Wait for all workers
+        exit_codes = [p.wait() for p in processes]
+        for lf in log_files:
+            lf.close()
+        print(f"\n=== All workers finished. Exit codes: {exit_codes} ===")
+
+        # Merge per-worker CSV files into one
+        merged_rows = []
+        csv_fields = None
+        for gid in range(num_gpus):
+            worker_csv = os.path.join(log_dir, f"attack_stats_gpu{gid}.csv")
+            if os.path.exists(worker_csv):
+                with open(worker_csv, 'r', newline='') as f:
+                    reader = csv.DictReader(f)
+                    if csv_fields is None:
+                        csv_fields = reader.fieldnames
+                    merged_rows.extend(list(reader))
+
+        if merged_rows and csv_fields:
+            merged_path = os.path.join(log_dir, "attack_stats.csv")
+            with open(merged_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=csv_fields)
+                writer.writeheader()
+                writer.writerows(merged_rows)
+            print(f"Merged CSV ({len(merged_rows)} rows) saved to: {merged_path}")
+
+        # Print summary of all logs
+        print(f"\nLogs and CSV saved to: {log_dir}/")
+        for gid in range(num_gpus):
+            print(f"  attack_gpu{gid}.log")
+        print(f"  attack_stats.csv")
+
+        return
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
@@ -492,6 +611,7 @@ def main():
         model_path=args.model,
         device=args.device,
         dtype=torch.float32,
+        vision_only=args.vision_only,
     )
 
     results_summary = []
@@ -528,14 +648,20 @@ def main():
                 torch.save(result, output_pt_path)
 
             results_summary.append({
+                'token_id': token,
+                'camera': camera,
                 'video': video_path,
                 'output': output_video_path,
                 'initial_cos_sim': result['initial_cos_sim'],
                 'final_cos_sim': result['final_cos_sim'],
+                'final_loss': result['final_loss'],
                 'reduction': result['initial_cos_sim'] - result['final_cos_sim'],
+                'elapsed_time': result.get('elapsed_time', 0),
+                'perturbation_l_inf': result.get('perturbation_l_inf', 0),
+                'perturbation_l2': result.get('perturbation_l2', 0),
             })
 
-            print(f"  {label}: cos_sim {result['initial_cos_sim']:.4f} -> {result['final_cos_sim']:.4f}")
+            print(f"  {label}: cos_sim {result['initial_cos_sim']:.4f} -> {result['final_cos_sim']:.4f} | loss={result['final_loss']:.4f}")
 
         except Exception as e:
             print(f"Error processing {video_path}: {e}")
@@ -575,6 +701,37 @@ def main():
             f.write(f"{r['video']}: {r['initial_cos_sim']:.4f} -> {r['final_cos_sim']:.4f} (reduction: {r['reduction']:.4f})\n")
 
     print(f"Summary saved to: {summary_path}")
+
+    # Save CSV stats
+    if results_summary:
+        # Determine CSV output directory
+        if args.log_dir:
+            csv_dir = args.log_dir
+        else:
+            # Standalone single-GPU run: create timestamped log dir
+            timestamp = datetime.now().strftime("%m%d_%H%M%S")
+            csv_dir = os.path.join("logs", timestamp)
+        os.makedirs(csv_dir, exist_ok=True)
+
+        # Use per-GPU filename when running as a multi-GPU worker so the
+        # parallel-mode parent process can merge them afterwards.
+        if args.num_gpus > 1:
+            csv_name = f"attack_stats_gpu{args.gpu_id}.csv"
+        else:
+            csv_name = "attack_stats.csv"
+        csv_path = os.path.join(csv_dir, csv_name)
+
+        csv_fields = [
+            'token_id', 'camera', 'initial_cos_sim', 'final_cos_sim',
+            'final_loss', 'reduction', 'elapsed_time',
+            'perturbation_l_inf', 'perturbation_l2',
+        ]
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(results_summary)
+
+        print(f"CSV stats saved to: {csv_path}")
 
 
 if __name__ == "__main__":

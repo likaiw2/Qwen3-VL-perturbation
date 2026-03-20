@@ -47,6 +47,7 @@ class Qwen3VLPGD:
         model_path: str = "Qwen/Qwen3-VL-4B-Instruct",
         device: str = "cuda:0",
         dtype: torch.dtype = torch.float32,
+        vision_only: bool = False,
     ):
         """
         Initialize the PGD attack on Qwen3-VL.
@@ -55,23 +56,51 @@ class Qwen3VLPGD:
             model_path: HuggingFace model path or local path to the Qwen3-VL model
             device: Device to run on (e.g., "cuda:0", "cpu"). Determines where tensors are placed.
             dtype: Data type for computations (float32 recommended for stable gradients)
+            vision_only: If True, only load the vision encoder and discard the LLM
+                         to save GPU memory. Sufficient for PGD attack which only
+                         needs visual features.
         """
         self.device = device
         self.dtype = dtype
         self.model_path = model_path
+        self.vision_only = vision_only
 
-        # Load model and processor from HuggingFace
-        print(f"Loading model from {model_path}...")
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            device_map=device,  # Automatically place model on specified device
-            torch_dtype=dtype,   # Use specified data type for model weights
-            trust_remote_code=True,  # Allow custom code from model repo
-        )
+        # Load processor from HuggingFace
+        print(f"Loading model from {model_path} (vision_only={vision_only})...")
         self.processor = AutoProcessor.from_pretrained(
             model_path,
             trust_remote_code=True,  # Allow custom code from processor repo
         )
+
+        if vision_only:
+            # Vision-only mode: load model to CPU first, strip LLM, then move
+            # vision encoder to target device. This avoids GPU OOM during loading.
+            # Model structure:
+            #   self.model (Qwen3VLForConditionalGeneration)
+            #     ├── model (Qwen3VLModel)
+            #     │   ├── visual (Qwen3VLVisionModel)  ← keep
+            #     │   └── language_model (Qwen3VLTextModel)  ← delete
+            #     └── lm_head (nn.Linear)  ← delete
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                device_map="cpu",       # Load entirely to CPU first
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+            del self.model.lm_head
+            del self.model.model.language_model
+            import gc; gc.collect()
+            # Move the remaining vision encoder to target device
+            self.model = self.model.to(device)
+            torch.cuda.empty_cache()
+            print("Vision-only mode: LLM and lm_head removed to save VRAM.")
+        else:
+            self.model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                device_map=device,      # Place full model on target device
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
 
         # Freeze model parameters - we only compute gradients w.r.t. input, not model weights
         self.model.eval()  # Set model to evaluation mode (disable dropout, batch norm, etc.)
@@ -494,6 +523,7 @@ class Qwen3VLPGD:
             'video_grid_thw': video_grid_thw.cpu(),
             'initial_cos_sim': 1.0,
             'final_cos_sim': best_cos_sim,
+            'final_loss': best_cos_sim,  # loss == cos_sim in this attack
             'cos_sim_history': cos_sim_history,
             'eps': eps,
             'alpha': alpha,
@@ -639,6 +669,7 @@ class Qwen3VLPGD:
             'video_grid_thw': video_grid_thw.cpu(),  # Grid dimensions in patch units
             'initial_cos_sim': 1.0,  # Initial cosine similarity (always 1.0)
             'final_cos_sim': best_cos_sim,  # Final cosine similarity after attack
+            'final_loss': best_cos_sim,  # loss == cos_sim in this attack
             'cos_sim_history': cos_sim_history,  # Cosine similarity at each iteration
             'eps': eps,  # Maximum perturbation magnitude used
             'alpha': alpha,  # Step size used
@@ -723,7 +754,7 @@ class Qwen3VLPGD:
             # Get gradients w.r.t. pixel values
             grad = pixel_values_adv.grad.detach()
 
-            # Fix 3: Track best adversarial example BEFORE update
+            # Track best adversarial example BEFORE update
             current_cos_sim = loss.item()
             cos_sim_history.append(current_cos_sim)
 
@@ -784,6 +815,7 @@ class Qwen3VLPGD:
             'image_grid_thw': image_grid_thw.cpu(),  # Grid dimensions in patch units
             'initial_cos_sim': 1.0,  # Initial cosine similarity (always 1.0)
             'final_cos_sim': best_cos_sim,  # Final cosine similarity after attack
+            'final_loss': best_cos_sim,  # loss == cos_sim in this attack
             'cos_sim_history': cos_sim_history,  # Cosine similarity at each iteration
             'eps': eps,  # Maximum perturbation magnitude used
             'alpha': alpha,  # Step size used
@@ -863,6 +895,8 @@ def parse_args():
                         help="Text prompt for the model (auto-generated if not provided)")
     parser.add_argument("--fps", type=float, default=1.0,
                         help="Video frame sampling rate (frames per second)")
+    parser.add_argument("--vision-only", action="store_true",
+                        help="Only load vision encoder, skip LLM to save VRAM")
 
     return parser.parse_args()
 
@@ -895,7 +929,10 @@ def main():
         args.text = "Describe this video." if is_video else "Describe this image."
 
     # Initialize the attacker with specified model and device
-    attacker = Qwen3VLPGD(model_path=args.model, device=args.device, dtype=torch.float32)
+    attacker = Qwen3VLPGD(
+        model_path=args.model, device=args.device, dtype=torch.float32,
+        vision_only=args.vision_only,
+    )
 
     # Execute attack based on input type
     if is_video:
