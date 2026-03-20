@@ -417,7 +417,7 @@ def main():
                              "(e.g. data/QA_Scenes_500). Takes precedence over --data_dir.")
     parser.add_argument("--output_dir", type=str, default="data/NuScenes_Attack_Patch",
                         help="Output directory for attacked videos")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-4B-Instruct",
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL-8B-Instruct",
                         help="Model path")
     parser.add_argument("--device", type=str, default="cuda:1",
                         help="Device to run on")
