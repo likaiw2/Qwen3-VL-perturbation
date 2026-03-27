@@ -18,6 +18,7 @@ Dual GPU:
 import argparse
 import json
 import os
+import re
 import time
 import multiprocessing as mp
 
@@ -30,6 +31,83 @@ try:
     QWEN_VL_UTILS_AVAILABLE = True
 except ImportError:
     QWEN_VL_UTILS_AVAILABLE = False
+
+
+JUDGE_PROMPT_TEMPLATE = (
+    "You are an evaluation judge. Given a question, a ground-truth (GT) answer, "
+    "and a model's prediction, determine whether the prediction is semantically correct.\n\n"
+    "Rules:\n"
+    "- The prediction does NOT need to match the GT word-for-word.\n"
+    "- If the prediction conveys the same meaning or contains the correct answer, it is correct.\n"
+    "- If the GT is a single word like 'truck', and the prediction says 'a white truck', that is correct.\n"
+    "- If the GT is 'moving' and the prediction says 'walking on the sidewalk', that is correct.\n"
+    "- If the GT is '0' or 'zero' and the prediction says 'there are none' or 'zero', that is correct.\n"
+    "- Only output a single word: 'Yes' or 'No'.\n\n"
+    "Question: {question}\n"
+    "GT answer: {gt}\n"
+    "Prediction: {prediction}\n\n"
+    "Is the prediction correct? (Yes/No):"
+)
+
+
+def _rule_judge(gt: str, prediction: str):
+    """Fast rule-based judge for simple GT types (numbers, yes/no).
+    Returns True/False if a rule matched, or None if LLM judge is needed."""
+    gt_lower = gt.strip().lower()
+    pred_lower = prediction.strip().lower()
+
+    # --- Yes / No ---
+    if gt_lower in ("yes", "no"):
+        # Extract leading yes/no from prediction
+        m = re.match(r"^\s*(yes|no)\b", pred_lower)
+        if m:
+            return m.group(1) == gt_lower
+        return None  # ambiguous → fall through to LLM
+
+    # --- Number (integer) ---
+    if re.fullmatch(r"[0-9]+", gt_lower):
+        gt_num = int(gt_lower)
+        # Try to extract a leading number from prediction
+        m = re.match(r"^\s*([0-9]+)\b", pred_lower)
+        if m:
+            return int(m.group(1)) == gt_num
+        # Also handle written-out numbers for 0-10
+        word2num = {
+            "zero": 0, "no": 0, "none": 0,
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        }
+        first_word = re.match(r"^\s*([a-z]+)\b", pred_lower)
+        if first_word and first_word.group(1) in word2num:
+            return word2num[first_word.group(1)] == gt_num
+        return None  # ambiguous → fall through to LLM
+
+    return None  # not a simple GT type
+
+
+def judge_answer(model, processor, device: str, question: str, gt: str, prediction: str) -> bool:
+    """Use the local model as a judge to determine if prediction semantically matches GT."""
+    if prediction is None or gt is None:
+        return False
+
+    # Fast path: rule-based for numbers and yes/no
+    rule_result = _rule_judge(gt, prediction)
+    if rule_result is not None:
+        return rule_result
+
+    prompt_text = JUDGE_PROMPT_TEMPLATE.format(question=question, gt=gt, prediction=prediction)
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt_text}]}]
+    prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[prompt], return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        output_ids = model.generate(**inputs, max_new_tokens=8, do_sample=False)
+
+    input_len = inputs["input_ids"].shape[1]
+    generated_ids = output_ids[:, input_len:]
+    answer = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip().lower()
+    return answer.startswith("yes")
 
 
 def load_model(model_path: str, device: str):
@@ -147,6 +225,9 @@ def run_worker(rank: int, world_size: int, tokens: list, token2qa: dict, args, o
                 "original": None,
                 "randnoise": None,
                 "pgd": None,
+                "judge_original": None,
+                "judge_randnoise": None,
+                "judge_pgd": None,
             }
 
             try:
@@ -170,6 +251,17 @@ def run_worker(rank: int, world_size: int, tokens: list, token2qa: dict, args, o
             else:
                 print(f"[GPU{rank}|{device}] WARN: Randnoise video not found: {rand_video}")
 
+            # --- LLM-judge: semantic correctness ---
+            for field in ("original", "randnoise", "pgd"):
+                pred = entry.get(field)
+                if pred is not None:
+                    try:
+                        entry[f"judge_{field}"] = judge_answer(
+                            model, processor, device, question, gt, pred
+                        )
+                    except Exception as e:
+                        print(f"[GPU{rank}|{device}] ERROR judge {field} {token}: {e}")
+
             results.append(entry)
 
         elapsed = time.time() - t0
@@ -183,16 +275,29 @@ def run_worker(rank: int, world_size: int, tokens: list, token2qa: dict, args, o
 
 
 def print_stats(results):
-    def acc(field):
+    def exact_acc(field):
         valid = [r for r in results if r.get(field) is not None and r.get("gt") is not None]
         if not valid:
             return 0.0, 0
         correct = sum(r[field].strip().lower() == r["gt"].strip().lower() for r in valid)
         return correct / len(valid) * 100, len(valid)
 
+    def judge_acc(field):
+        judge_key = f"judge_{field}"
+        valid = [r for r in results if r.get(judge_key) is not None]
+        if not valid:
+            return 0.0, 0
+        correct = sum(1 for r in valid if r[judge_key] is True)
+        return correct / len(valid) * 100, len(valid)
+
+    print("\n" + "=" * 60)
+    print(f"{'Field':<12} {'Exact Match':>14} {'LLM-Judge':>14} {'n':>6}")
+    print("-" * 60)
     for field in ("original", "randnoise", "pgd"):
-        a, n = acc(field)
-        print(f"Accuracy  {field:<10}: {a:.1f}%  (n={n})")
+        ea, en = exact_acc(field)
+        ja, jn = judge_acc(field)
+        print(f"{field:<12} {ea:>12.1f}%  {ja:>12.1f}%  {max(en, jn):>5d}")
+    print("=" * 60)
 
 
 def main():

@@ -14,11 +14,12 @@ import os
 import glob
 import subprocess
 import sys
+import tempfile
+import shutil
 from datetime import datetime
 import torch
 import cv2
 import numpy as np
-from pathlib import Path
 from tqdm import tqdm
 from qwen_pgd_attack import Qwen3VLPGD
 
@@ -85,6 +86,103 @@ def create_output_dir(output_base: str, scene: str, token: str) -> str:
     return output_dir
 
 
+def _squeeze_single_video_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Accept single-item batched tensors while keeping true [N, D] tensors intact."""
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+    if tensor.ndim == 3 and tensor.shape[0] == 1:
+        return tensor[0]
+    if tensor.ndim == 2 and tensor.shape == (1, 3):
+        return tensor[0]
+    return tensor
+
+
+def reconstruct_qwen_video_tensor_from_pixel_values(
+    pixel_values: torch.Tensor,
+    video_grid_thw: torch.Tensor,
+    patch_size: int = 16,
+    temporal_patch_size: int = 2,
+    merge_size: int = 2,
+) -> torch.Tensor:
+    """Invert Qwen2/3-VL video patch flattening back to [T, C, H, W] normalized frames."""
+    pixel_values = _squeeze_single_video_tensor(pixel_values)
+    video_grid_thw = _squeeze_single_video_tensor(video_grid_thw)
+
+    if pixel_values.ndim != 2:
+        raise ValueError(f"Expected pixel_values to have shape [N, D], got {tuple(pixel_values.shape)}")
+    if video_grid_thw.ndim != 1 or video_grid_thw.numel() != 3:
+        raise ValueError(f"Expected video_grid_thw to have shape [3], got {tuple(video_grid_thw.shape)}")
+
+    grid_t, grid_h, grid_w = [int(v) for v in video_grid_thw.tolist()]
+    expected_patches = grid_t * grid_h * grid_w
+    if pixel_values.shape[0] != expected_patches:
+        raise ValueError(
+            f"pixel_values patch count mismatch: got {pixel_values.shape[0]}, expected {expected_patches}"
+        )
+    if grid_h % merge_size != 0 or grid_w % merge_size != 0:
+        raise ValueError(
+            f"grid_h/grid_w must be divisible by merge_size: {(grid_h, grid_w)} vs merge_size={merge_size}"
+        )
+
+    channel = 3
+    expected_dim = channel * temporal_patch_size * patch_size * patch_size
+    if pixel_values.shape[1] != expected_dim:
+        raise ValueError(
+            f"pixel_values dim mismatch: got {pixel_values.shape[1]}, expected {expected_dim} "
+            f"(3 * {temporal_patch_size} * {patch_size} * {patch_size})"
+        )
+
+    video_tensor = pixel_values.reshape(
+        grid_t,
+        grid_h // merge_size,
+        grid_w // merge_size,
+        merge_size,
+        merge_size,
+        channel,
+        temporal_patch_size,
+        patch_size,
+        patch_size,
+    )
+    video_tensor = video_tensor.permute(0, 6, 5, 1, 3, 7, 2, 4, 8).contiguous()
+    video_tensor = video_tensor.reshape(
+        grid_t * temporal_patch_size,
+        channel,
+        grid_h * patch_size,
+        grid_w * patch_size,
+    )
+    return video_tensor
+
+
+def _denormalize_qwen_video_tensor(
+    video_tensor: torch.Tensor,
+    model_mean: torch.Tensor = None,
+    model_std: torch.Tensor = None,
+) -> torch.Tensor:
+    """Convert normalized [T, C, H, W] frames back to uint8 RGB [T, H, W, C]."""
+    if video_tensor.ndim != 4 or video_tensor.shape[1] != 3:
+        raise ValueError(f"Expected video_tensor to have shape [T, 3, H, W], got {tuple(video_tensor.shape)}")
+
+    device = video_tensor.device
+    dtype = video_tensor.dtype
+    if model_mean is None:
+        model_mean = torch.tensor([0.5, 0.5, 0.5], device=device, dtype=dtype)
+    else:
+        model_mean = torch.as_tensor(model_mean, device=device, dtype=dtype).reshape(-1)
+    if model_std is None:
+        model_std = torch.tensor([0.5, 0.5, 0.5], device=device, dtype=dtype)
+    else:
+        model_std = torch.as_tensor(model_std, device=device, dtype=dtype).reshape(-1)
+
+    if model_mean.numel() != 3 or model_std.numel() != 3:
+        raise ValueError(
+            f"model_mean/model_std must each contain 3 values, got {model_mean.numel()} and {model_std.numel()}"
+        )
+
+    frames_01 = video_tensor * model_std.view(1, 3, 1, 1) + model_mean.view(1, 3, 1, 1)
+    frames_rgb = frames_01.clamp(0, 1).mul(255.0).round().to(torch.uint8)
+    return frames_rgb.permute(0, 2, 3, 1).cpu()
+
+
 def save_adversarial_video_direct(
     pixel_values_clean: torch.Tensor,
     pixel_values_adv: torch.Tensor,
@@ -92,97 +190,56 @@ def save_adversarial_video_direct(
     original_video_path: str,
     output_path: str,
     eps: float = 8/255,
+    model_mean: torch.Tensor = None,
     model_std: torch.Tensor = None,
+    lossless: bool = False,
+    sample_fps: float = None,
+    patch_size: int = 16,
+    temporal_patch_size: int = 2,
+    merge_size: int = 2,
 ):
-    import subprocess
-    import tempfile
-    import shutil
+    # Keep unused args for compatibility with existing callers and CLI surface.
+    del pixel_values_clean, original_video_path, eps
 
-    # pixel_values shape: [N_patches, D] where D = 3 * temporal_patch_size * 14 * 14
-    # Qwen3-VL Conv3d patch embed: channel dim (3) is first in the D dimension.
-    perturbation = pixel_values_adv - pixel_values_clean  # [N, D], normalized space
-    N, D = perturbation.shape
-
-    # Denormalize: reshape to [N, 3, D/3] so std broadcasts over channel dim only.
-    # model_std should come from the same attacker instance to stay in sync (Fix 4).
-    if model_std is None:
-        model_std = torch.tensor([0.26862954, 0.26130258, 0.27577711])
-    model_std = model_std.to(device=perturbation.device, dtype=perturbation.dtype).view(3)
-    p = perturbation.view(N, 3, -1) * model_std.view(1, 3, 1)  # [N, 3, D/3], in [0,1] scale
-
-    # Mean over spatial+temporal dims → per-patch per-channel perturbation [N, 3]
-    patch_perturbations = p.mean(dim=2).cpu().numpy()  # [N, 3] RGB
-
-    t, grid_h, grid_w = video_grid_thw[0].tolist()
-    t, grid_h, grid_w = int(t), int(grid_h), int(grid_w)
+    if sample_fps is None:
+        sample_fps = 1.0
 
     temp_dir = tempfile.mkdtemp()
-
     try:
+        adv_video_tensor = reconstruct_qwen_video_tensor_from_pixel_values(
+            pixel_values=pixel_values_adv,
+            video_grid_thw=video_grid_thw,
+            patch_size=patch_size,
+            temporal_patch_size=temporal_patch_size,
+            merge_size=merge_size,
+        )
+        adv_frames_rgb = _denormalize_qwen_video_tensor(
+            adv_video_tensor,
+            model_mean=model_mean,
+            model_std=model_std,
+        ).numpy()
+
         frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
-        subprocess.run(['ffmpeg', '-y', '-i', original_video_path, '-vsync', '0', frame_pattern],
-                       capture_output=True, check=True)
+        for idx, frame_rgb in enumerate(adv_frames_rgb):
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame_path = os.path.join(temp_dir, f"frame_{idx + 1:06d}.png")
+            if not cv2.imwrite(frame_path, frame_bgr):
+                raise RuntimeError(f"Failed to write frame: {frame_path}")
 
-        frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.png")))
-        total_frames = len(frame_files)
-        if total_frames == 0:
-            return None
-
-        temporal_patch_size = 2
-        total_temporal_units = t * temporal_patch_size
-        frames_per_unit = max(1, total_frames // total_temporal_units) if total_temporal_units > 0 else total_frames
-
-        for frame_idx, frame_file in enumerate(frame_files):
-            frame = cv2.imread(frame_file)  # BGR
-            if frame is None:
-                continue
-
-            height, width = frame.shape[:2]
-            temporal_idx = min(frame_idx // frames_per_unit, total_temporal_units - 1)
-            t_idx = temporal_idx // temporal_patch_size
-
-            # Build per-pixel RGB noise from continuous per-patch perturbations
-            noise_blocks = np.zeros((height, width, 3), dtype=np.float32)
-
-            for h_idx in range(grid_h):
-                for w_idx in range(grid_w):
-                    patch_idx = t_idx * grid_h * grid_w + h_idx * grid_w + w_idx
-                    p_val_rgb = patch_perturbations[patch_idx] if patch_idx < len(patch_perturbations) else np.zeros(3)
-                    p_val_rgb = np.clip(p_val_rgb, -eps, eps)
-
-                    y_start = int(h_idx * height / grid_h)
-                    y_end   = int((h_idx + 1) * height / grid_h)
-                    x_start = int(w_idx * width / grid_w)
-                    x_end   = int((w_idx + 1) * width / grid_w)
-
-                    # RGB → BGR for OpenCV, scale to pixel range [0,255]
-                    noise_blocks[y_start:y_end, x_start:x_end] = p_val_rgb[::-1] * 255.0
-
-            kernel_size = max(31, min(height, width) // max(grid_h, grid_w)) | 1
-            noise_smooth = cv2.GaussianBlur(noise_blocks, (kernel_size, kernel_size), kernel_size / 3)
-
-            frame_adv = np.clip(frame.astype(np.float32) + noise_smooth, 0, 255).astype(np.uint8)
-            cv2.imwrite(frame_file, frame_adv)
-
-        # Get original video FPS
-        probe_result = subprocess.run([
-            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-            '-show_entries', 'stream=r_frame_rate',
-            '-of', 'csv=p=0', original_video_path
-        ], capture_output=True, text=True)
-        fps_str = probe_result.stdout.strip()
-        if '/' in fps_str:
-            num, den = fps_str.split('/')
-            fps = float(num) / float(den)
+        if lossless:
+            subprocess.run([
+                'ffmpeg', '-y', '-framerate', str(float(sample_fps)),
+                '-i', frame_pattern,
+                '-c:v', 'ffv1', '-pix_fmt', 'gbrp',
+                output_path
+            ], capture_output=True, check=True)
         else:
-            fps = float(fps_str) if fps_str else 30.0
-
-        subprocess.run([
-            'ffmpeg', '-y', '-framerate', str(fps),
-            '-i', frame_pattern,
-            '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-            '-preset', 'fast', output_path
-        ], capture_output=True, check=True)
+            subprocess.run([
+                'ffmpeg', '-y', '-framerate', str(float(sample_fps)),
+                '-i', frame_pattern,
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-preset', 'fast', output_path
+            ], capture_output=True, check=True)
 
         return output_path
 
@@ -285,7 +342,6 @@ def save_pixel_level_adversarial_video(
     adv_frames = result['adv_frames']  # [T_sampled, H, W, C] RGB uint8
     clean_frames = result['clean_frames']
     sampled_indices = result['sampled_indices']
-    total_frames = result['total_frames']
     original_fps = result.get('original_fps', 30.0)
 
     # Compute per-frame perturbation
@@ -408,7 +464,9 @@ def save_result(result, args, video_path, output_video_path, attacker):
             eps=args.eps,
             original_video_path=video_path,
             output_path=output_video_path,
+            model_mean=attacker.image_mean.cpu(),
             model_std=attacker.image_std.cpu(),
+            sample_fps=args.fps,
         )
 
 
